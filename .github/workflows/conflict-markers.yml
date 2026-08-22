@@ -1,0 +1,63 @@
+name: Conflict Markers
+
+# Committing a conflict unresolved is a deliberate step here: the live-docs
+# backport (docs-backport.yml) keeps the markers so a maintainer settles them in
+# the PR it opens. Nothing stopped such a branch from merging — the only job
+# that went red was prettier, and only because `>>>>>>> <sha>` parses as nested
+# blockquotes, so the failure read as a formatting nit. This says what is
+# actually wrong, on every pull request, whatever the file type and wherever
+# prettier does not reach (`.prettierignore` covers generated trees, fixtures,
+# lockfiles and translation catalogs).
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  conflict-markers:
+    name: Conflict Markers
+    # Drafts are checked too, unlike the jobs in test.yaml: this one takes
+    # seconds, and a branch carrying markers should say so from the first push.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Check the changed files for conflict markers
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+
+          # git writes seven characters at the start of a line and then a label.
+          # An opening or a closing marker identifies the conflict on its own;
+          # `=======` is left out because a line of seven equals signs is also a
+          # Markdown setext heading underline.
+          MARKER='^(<{7}|>{7})( |$)'
+
+          # Every book's docs/theme is a symlink to a directory, which grep would
+          # otherwise follow and fail on.
+          git diff -z --name-only --diff-filter=d "$BASE"...HEAD > /tmp/changed
+          xargs -0 --no-run-if-empty \
+            grep --line-number --with-filename --binary-files=without-match \
+                 --no-messages --directories=skip -E "$MARKER" -- \
+            < /tmp/changed > /tmp/markers || true
+
+          if [ ! -s /tmp/markers ]; then
+            echo "No conflict markers in the files this pull request changes."
+            exit 0
+          fi
+
+          cat /tmp/markers
+          while IFS=: read -r file line _; do
+            echo "::error file=$file,line=$line::Unresolved conflict marker."
+          done < /tmp/markers
+          echo "::error::Conflict markers found in the diff — resolve them before merging."
+          exit 1
