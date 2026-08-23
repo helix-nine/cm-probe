@@ -1,10 +1,10 @@
 name: Conflict Markers
 
-# The live-docs backport (docs-backport.yml) commits a conflict with its markers
-# intact so a maintainer settles it in the PR it opens, and GitHub reports that
-# branch as mergeable. Prettier reaches only the files it formats, so this looks
-# at every file a pull request changes.
+# A conflict's markers are ordinary file content, so GitHub reports a branch
+# carrying them as mergeable.
 on:
+  # Drafts are checked too, unlike the jobs in test.yaml: a branch carrying
+  # markers should say so from its first push.
   pull_request:
 
 permissions:
@@ -17,14 +17,15 @@ concurrency:
 jobs:
   conflict-markers:
     name: Conflict Markers
-    # Draft pull requests are checked too, unlike the jobs in test.yaml: a branch
-    # carrying markers should say so from its first push.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
+          # The whole history, because the diff is taken against the base, but
+          # without the blobs: only the working tree is ever read.
           fetch-depth: 0
+          filter: blob:none
 
       - name: Check the changed files for conflict markers
         env:
@@ -33,26 +34,39 @@ jobs:
           set -euo pipefail
           : "${BASE:?the pull request carried no base commit}"
 
-          # git writes seven characters and then a label. `=======` is left out
-          # because seven equals signs also underline a Markdown setext heading.
-          MARKER='^(<{7}|>{7})( |$)'
+          # A conflict is bounded by an opening and a closing marker, and a
+          # half-resolved one can be left holding only the divider.
+          MARKER='^(<{7}|>{7})( |$)|^={7}$'
 
-          git diff -z --name-only --diff-filter=d "$BASE"...HEAD > /tmp/changed
+          # Rename detection would read the blobs the checkout above skipped, and
+          # a symlink such as a book's docs/theme has no content to scan.
+          git diff -z --name-only --no-renames --diff-filter=d "$BASE"...HEAD |
+            while IFS= read -r -d '' file; do
+              if [ -f "$file" ]; then printf '%s\0' "$file"; fi
+            done > /tmp/changed
 
-          # Every book's docs/theme is a symlink to a directory, which grep
-          # reports as an error unless it is told to skip directories.
+          # git decides a file is text from its first 8000 bytes and writes
+          # markers into it, so grep has to read a later NUL as text as well.
           xargs -0 --no-run-if-empty \
-            grep --line-number --with-filename --binary-files=without-match \
-                 --directories=skip -E "$MARKER" -- \
-            < /tmp/changed > /tmp/markers || true
+            grep --line-number --with-filename --binary-files=text -E "$MARKER" -- \
+            < /tmp/changed > /tmp/markers 2> /tmp/scan-errors || true
+
+          # xargs reports a grep that matched nothing and a grep that failed with
+          # the same status, so a file left unscanned shows up only on stderr.
+          if [ -s /tmp/scan-errors ]; then
+            cat /tmp/scan-errors
+            echo "::error::Some of the changed files could not be scanned for conflict markers."
+            exit 1
+          fi
 
           if [ ! -s /tmp/markers ]; then
             echo "No conflict markers in the files this pull request changes."
             exit 0
           fi
 
-          cat /tmp/markers
-          echo "::error::Conflict markers found in the diff — resolve them before merging."
+          echo "::error::Conflict markers found in the files this pull request changes — resolve them before merging."
+          # A file name can start with `::`, which the runner reads as a command.
+          sed 's/^/marker: /' /tmp/markers
           while IFS=: read -r file line _; do
             echo "::error file=$file,line=$line::Unresolved conflict marker."
           done < /tmp/markers
