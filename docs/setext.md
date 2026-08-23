@@ -1,4 +1,3 @@
-seven
-=======
+# seven
 
-still a setext heading
+still a heading
