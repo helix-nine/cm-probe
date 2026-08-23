@@ -3,14 +3,16 @@ name: Conflict Markers
 # A conflict's markers are ordinary file content, so GitHub reports a branch
 # carrying them as mergeable.
 on:
-  # Drafts are checked too, unlike the jobs in test.yaml: a branch carrying
-  # markers should say so from its first push.
+  # A branch carrying markers should say so from its first push, so this check
+  # has no draft gate.
   pull_request:
 
 permissions:
   contents: read
 
 concurrency:
+  # Keyed on the pull request rather than the branch, because one branch can have
+  # a pull request open against both master and an integration branch.
   group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
@@ -22,8 +24,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-          # The whole history, because the diff is taken against the base, but
-          # without the blobs: only the working tree is ever read.
+          # git diff needs the base commit, which a shallow fetch would leave out.
           fetch-depth: 0
           filter: blob:none
 
@@ -35,14 +36,17 @@ jobs:
           : "${BASE:?the pull request carried no base commit}"
 
           # A conflict is bounded by an opening and a closing marker, and a
-          # half-resolved one can be left holding only the divider.
-          MARKER='^(<{7}|>{7})( |$)|^={7}$'
+          # half-resolved one can be left holding only the divider, so a bare
+          # `=======` in a fenced example or a vendored licence fails too.
+          # `$'…'` makes `\r` a carriage return, which a CRLF file's markers carry.
+          MARKER=$'^(<{7}|>{7}|\|{7})( |\r?$)|^={7}\r?$'
 
-          # Rename detection would read the blobs the checkout above skipped, and
-          # a symlink such as a book's docs/theme has no content to scan.
-          git diff -z --name-only --no-renames --diff-filter=d "$BASE"...HEAD |
+          # Rename detection would fetch the blobs the checkout above skipped.
+          git diff -z --name-only --no-renames "$BASE"...HEAD |
             while IFS= read -r -d '' file; do
-              if [ -f "$file" ]; then printf '%s\0' "$file"; fi
+              # grep writes an error for anything that is not a regular file, such
+              # as a book's docs/theme symlink, and the gate below fails on it.
+              if [ -f "$file" ] && [ ! -L "$file" ]; then printf '%s\0' "$file"; fi
             done > /tmp/changed
 
           # git decides a file is text from its first 8000 bytes and writes
@@ -50,6 +54,16 @@ jobs:
           xargs -0 --no-run-if-empty \
             grep --line-number --with-filename --binary-files=text -E "$MARKER" -- \
             < /tmp/changed > /tmp/markers 2> /tmp/scan-errors || true
+
+          if [ -s /tmp/markers ]; then
+            echo "::error::Conflict markers found in the files this pull request changes — resolve them before merging."
+            # The prefix stops the runner reading a file name that starts with
+            # `::` as a workflow command.
+            sed 's/^/marker: /' /tmp/markers
+            while IFS=: read -r file line _; do
+              echo "::error file=$file,line=$line::Unresolved conflict marker."
+            done < /tmp/markers
+          fi
 
           # xargs reports a grep that matched nothing and a grep that failed with
           # the same status, so a file left unscanned shows up only on stderr.
@@ -59,15 +73,8 @@ jobs:
             exit 1
           fi
 
-          if [ ! -s /tmp/markers ]; then
-            echo "No conflict markers in the files this pull request changes."
-            exit 0
+          if [ -s /tmp/markers ]; then
+            exit 1
           fi
 
-          echo "::error::Conflict markers found in the files this pull request changes — resolve them before merging."
-          # A file name can start with `::`, which the runner reads as a command.
-          sed 's/^/marker: /' /tmp/markers
-          while IFS=: read -r file line _; do
-            echo "::error file=$file,line=$line::Unresolved conflict marker."
-          done < /tmp/markers
-          exit 1
+          echo "No conflict markers in the files this pull request changes."
